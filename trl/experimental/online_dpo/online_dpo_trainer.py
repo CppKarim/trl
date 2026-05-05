@@ -339,6 +339,8 @@ class OnlineDPOTrainer(BaseTrainer):
 
         self.max_length = args.max_length
 
+        self.train_samples: list[dict] = []  # flushed to W&B table each log interval
+
         self.stats = {
             "objective/kl": [],
             "objective/entropy": [],
@@ -718,14 +720,16 @@ class OnlineDPOTrainer(BaseTrainer):
             # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
             # num_generations outputs for each one. This is faster than generating outputs for each duplicate
             # prompt individually.
-            ordered_set_of_prompts = all_prompts[:: self.num_generations]
-            if has_images:
-                ordered_set_of_images = all_images[:: self.num_generations]
-            else:
-                ordered_set_of_images = None
+            #ordered_set_of_prompts = all_prompts[:: self.num_generations]
+            #if has_images:
+                #ordered_set_of_images = all_images[:: self.num_generations]
+            #else:
+                #ordered_set_of_images = None
+            if not has_images:
+                all_images=None
             completion_ids = self.vllm_client.generate(
-                prompts=ordered_set_of_prompts,
-                images=ordered_set_of_images,
+                prompts=all_prompts,
+                images=all_images,
                 n=self.num_generations,
                 repetition_penalty=self.repetition_penalty,
                 temperature=self.temperature,
@@ -738,8 +742,11 @@ class OnlineDPOTrainer(BaseTrainer):
                 else None,
                 generation_kwargs=self.args.generation_kwargs,
             )["completion_ids"]
-            # Flatten: each prompt generates 2 completions
-            completion_ids = [[comp_id] for prompt_completions in completion_ids for comp_id in prompt_completions]
+            completion_ids = [
+                completion_ids[prompt_idx * self.num_generations + gen_idx]
+                for gen_idx in range(self.num_generations)
+                for prompt_idx in range(len(all_prompts))
+            ]
         else:
             completion_ids = [None] * (len(all_prompts) * 2)
 
@@ -763,8 +770,9 @@ class OnlineDPOTrainer(BaseTrainer):
         )
         prompt_ids = []
         for prompt_tokens in prompt_inputs["input_ids"]:
-            prompt_ids.extend([prompt_tokens.tolist(), prompt_tokens.tolist()])  # 2 copies for 2 completions
-        return completion_ids, prompt_ids
+            #prompt_ids.extend([prompt_tokens.tolist(), prompt_tokens.tolist()])  # 2 copies for 2 completions
+            prompt_ids.extend([prompt_tokens.tolist()])  
+        return completion_ids, 2*prompt_ids
 
     def _generate_vllm_colocate(self, prompts, images=None):
         """Generate completions using vLLM colocate mode"""
@@ -1331,6 +1339,16 @@ class OnlineDPOTrainer(BaseTrainer):
         chosen_indices = batch_range + (~mask * batch_size)
         rejected_indices = batch_range + (mask * batch_size)
 
+        # Buffer one example per batch for W&B generation table (main process only)
+        if self.accelerator.is_main_process:
+            i = 0
+            self.train_samples.append({
+                "step": self.state.global_step,
+                "prompt": prompts[i] if isinstance(prompts[i], str) else str(prompts[i]),
+                "chosen": completions[chosen_indices[i].item()],
+                "rejected": completions[rejected_indices[i].item()],
+            })
+
         # Build tensor so that the first half is the chosen examples and the second half the rejected examples
         cr_indices = torch.cat((chosen_indices, rejected_indices), dim=0)  # cr = chosen and rejected
         cr_logprobs = logprobs[cr_indices]
@@ -1418,6 +1436,168 @@ class OnlineDPOTrainer(BaseTrainer):
 
         return loss.detach() / self.args.gradient_accumulation_steps
 
+    def evaluate(
+        self,
+        eval_dataset=None,
+        ignore_keys=None,
+        metric_key_prefix: str = "eval",
+    ) -> dict[str, float]:
+        eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        if eval_dataset is None:
+            return {}
+
+        self.model.eval()
+
+        # Force a weight sync before the first generation so the vLLM server
+        # reflects the latest training weights even if global_step hasn't changed.
+        self._last_loaded_step = -1
+
+        total_loss = 0.0
+        num_batches = 0
+        # Win-rate counters updated on main process only; broadcast at the end.
+        win_count = 0
+        total_valid = 0
+        total_samples = 0
+
+        for batch in self.get_eval_dataloader(eval_dataset):
+            prompts = batch["prompt"]
+            batch_size = len(prompts)
+            device = self.accelerator.device
+
+            if self.args.use_vllm:
+                prompt_ids, prompt_mask, completion_ids, completion_mask = self._generate_vllm(prompts)
+            else:
+                prompt_ids, prompt_mask, completion_ids, completion_mask = self._generate(self.model, prompts)
+
+            with torch.no_grad():
+                logprobs = self._forward(self.model, prompt_ids, prompt_mask, completion_ids, completion_mask)
+                if self.ref_model is not None:
+                    ref_logprobs = self._forward(
+                        self.ref_model, prompt_ids, prompt_mask, completion_ids, completion_mask
+                    )
+                else:
+                    with self.model.disable_adapter():
+                        ref_logprobs = self._forward(
+                            self.model, prompt_ids, prompt_mask, completion_ids, completion_mask
+                        )
+
+            completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+
+            # Determine chosen/rejected mask using the same logic as training_step.
+            if self.reward_funcs is not None:
+                if is_conversational({"prompt": prompts[0]}):
+                    completions_for_reward = [[{"role": "assistant", "content": c}] for c in completions]
+                else:
+                    completions_for_reward = completions
+                with torch.no_grad():
+                    rewards = self._calculate_rewards_from_functions(
+                        prompts=2 * prompts,
+                        completions=completions_for_reward,
+                        completion_ids_list=[completion_ids[i].tolist() for i in range(completion_ids.shape[0])],
+                    )
+                first_half, second_half = rewards.split(batch_size)
+                mask = first_half >= second_half
+
+            elif self.judge is not None:
+                if is_conversational({"prompt": prompts[0]}):
+                    environment = jinja2.Environment()
+                    template = environment.from_string(SIMPLE_CHAT_TEMPLATE)
+                    prompts_text = [template.render(messages=p) for p in prompts]
+                    completions_text = [
+                        template.render(messages=[{"role": "assistant", "content": c}]) for c in completions
+                    ]
+                else:
+                    prompts_text = list(prompts)
+                    completions_text = completions
+
+                # Gather to main process, judge once per batch, then broadcast ranks
+                # back so all processes can compute their local mask independently.
+                gathered_prompts = gather_object(prompts_text)
+                gathered_pairs = gather_object(
+                    [[completions_text[i], completions_text[i + batch_size]] for i in range(batch_size)]
+                )
+
+                if self.accelerator.is_main_process:
+                    ranks = self.judge.judge(gathered_prompts, gathered_pairs)
+                    valid = [r for r in ranks if r != -1]
+                    win_count += sum(r == 0 for r in valid)
+                    total_valid += len(valid)
+                    total_samples += len(gathered_prompts)
+                else:
+                    ranks = None
+
+                ranks = broadcast_object_list([ranks], from_process=0)[0]
+                proc_start = self.accelerator.process_index * batch_size
+                local_ranks = ranks[proc_start : proc_start + batch_size]
+                mask = torch.tensor([r == 0 for r in local_ranks], device=device)
+
+            else:
+                raise ValueError("One of `judge` or `reward_funcs` must be provided.")
+
+            # DPO loss — identical to training_step.
+            batch_range = torch.arange(batch_size, device=device)
+            chosen_indices = batch_range + (~mask * batch_size)
+            rejected_indices = batch_range + (mask * batch_size)
+            cr_indices = torch.cat((chosen_indices, rejected_indices), dim=0)
+
+            cr_logprobs = logprobs[cr_indices]
+            cr_ref_logprobs = ref_logprobs[cr_indices]
+            padding_mask = ~completion_mask.bool()
+            cr_padding_mask = padding_mask[cr_indices]
+            cr_logprobs_sum = (cr_logprobs * ~cr_padding_mask).sum(1)
+            cr_ref_logprobs_sum = (cr_ref_logprobs * ~cr_padding_mask).sum(1)
+
+            chosen_logprobs_sum, rejected_logprobs_sum = torch.split(cr_logprobs_sum, batch_size)
+            chosen_ref_logprobs_sum, rejected_ref_logprobs_sum = torch.split(cr_ref_logprobs_sum, batch_size)
+            pi_logratios = chosen_logprobs_sum - rejected_logprobs_sum
+            ref_logratios = chosen_ref_logprobs_sum - rejected_ref_logprobs_sum
+            logits = pi_logratios - ref_logratios
+
+            if self.args.loss_type == "sigmoid":
+                losses = -F.logsigmoid(self.beta * logits)
+            elif self.args.loss_type == "ipo":
+                losses = (logits - 1 / (2 * self.beta)) ** 2
+            else:
+                raise NotImplementedError(f"invalid loss type {self.args.loss_type}")
+
+            # gather_for_metrics returns the same scalar on every process.
+            total_loss += self.accelerator.gather_for_metrics(losses.mean()).mean().item()
+            num_batches += 1
+
+        self.model.train()
+
+        metrics: dict[str, float] = {}
+        if num_batches > 0:
+            #metrics[f"{metric_key_prefix}_loss"] = total_loss / num_batches
+            metrics[f"{metric_key_prefix}/loss"] = total_loss / num_batches
+        if self.accelerator.is_main_process:
+            if total_valid > 0:
+                metrics[f"{metric_key_prefix}/win_rate"] = win_count / total_valid
+                metrics[f"{metric_key_prefix}/judge_success_rate"] = (
+                    total_valid / total_samples if total_samples > 0 else 0.0
+                )
+            if total_samples > 0:
+                metrics[f"{metric_key_prefix}/num_samples"] = float(total_samples)
+
+        metrics = broadcast_object_list([metrics], from_process=0)[0]
+        self.log(metrics)
+        self.control = self.callback_handler.on_evaluate(
+            self.args, self.state, self.control, metrics=metrics
+        )
+        return metrics
+
+    def _determine_best_metric(self, metrics, trial):
+        # HF Trainer looks up f"eval_{metric_for_best_model}" with exact key matching.
+        # Normalize slash-format keys (e.g. eval/win_rate → eval_win_rate) so that
+        # metric_for_best_model can be specified in either wandb-style or HF-style.
+        normalized = {k.replace("/", "_"): v for k, v in metrics.items()}
+        original = self.args.metric_for_best_model
+        if original and "/" in original:
+            self.args.metric_for_best_model = original.replace("/", "_")
+        result = super()._determine_best_metric(metrics=normalized, trial=trial)
+        self.args.metric_for_best_model = original
+        return result
+
     # Same as Trainer._maybe_log_save_evaluate but log our metrics
     def _maybe_log_save_evaluate(
         self, tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval, start_time, learning_rate=None
@@ -1443,6 +1623,16 @@ class OnlineDPOTrainer(BaseTrainer):
             for key, val in self.stats.items():
                 logs[key] = sum(val) / len(val)
             self.stats = {key: [] for key in self.stats}  # reset stats
+
+            # Log buffered training generations as a W&B table
+            if self.accelerator.is_main_process and self.train_samples:
+                import wandb
+                table = wandb.Table(
+                    columns=["step", "prompt", "chosen", "rejected"],
+                    data=[[s["step"], s["prompt"], s["chosen"], s["rejected"]] for s in self.train_samples],
+                )
+                wandb.log({"train/generations": table}, step=self.state.global_step)
+                self.train_samples = []
 
             self._total_loss_scalar += tr_loss_scalar
             self._globalstep_last_logged = self.state.global_step
