@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
+import json
 import os
 import re
 import textwrap
@@ -27,6 +29,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data
 import transformers
+from tqdm import tqdm
 from accelerate import logging
 from accelerate.utils import broadcast_object_list, gather_object, is_peft_model
 from datasets import Dataset
@@ -62,6 +65,7 @@ from ..judges import BasePairwiseJudge
 from ..utils import SIMPLE_CHAT_TEMPLATE, DPODataCollatorWithPadding, prepare_peft_model, truncate_right
 from .online_dpo_config import OnlineDPOConfig
 
+from transformers.trainer import *
 
 if is_peft_available():
     from peft import PeftConfig, PeftModel
@@ -1436,6 +1440,226 @@ class OnlineDPOTrainer(BaseTrainer):
 
         return loss.detach() / self.args.gradient_accumulation_steps
 
+    def train(
+        self,
+        resume_from_checkpoint: Optional[Union[str, bool]] = None,
+        trial: Union["optuna.Trial", dict[str, Any], None] = None,
+        ignore_keys_for_eval: Optional[list[str]] = None,
+        **kwargs: Any,
+    ):
+        """
+        Main training entry point.
+
+        Args:
+            resume_from_checkpoint (`str` or `bool`, *optional*):
+                If a `str`, local path to a saved checkpoint as saved by a previous instance of [`Trainer`]. If a
+                `bool` and equals `True`, load the last checkpoint in *args.output_dir* as saved by a previous instance
+                of [`Trainer`]. If present, training will resume from the model/optimizer/scheduler states loaded here.
+            trial (`optuna.Trial` or `dict[str, Any]`, *optional*):
+                The trial run or the hyperparameter dictionary for hyperparameter search.
+            ignore_keys_for_eval (`list[str]`, *optional*)
+                A list of keys in the output of your model (if it is a dictionary) that should be ignored when
+                gathering predictions for evaluation during the training.
+            kwargs (`dict[str, Any]`, *optional*):
+                Additional keyword arguments used to hide deprecated arguments
+        """
+        if resume_from_checkpoint is False:
+            resume_from_checkpoint = None
+
+        # memory metrics - must set up as early as possible
+        self._memory_tracker.start()
+
+        args = self.args
+
+        self.is_in_train = True
+
+        # If the model uses a tokenizer, it may have a new tokens for fine-tuning purposes.
+        if isinstance(self.processing_class, (PreTrainedTokenizerBase, ProcessorMixin)) and hasattr(
+            self.model, "config"
+        ):
+            self._align_special_tokens()
+
+        # Attach NEFTune hooks if necessary
+        if self.neftune_noise_alpha is not None:
+            self.model = self._activate_neftune(self.model)
+
+        # do_train is not a reliable argument, as it might not be set and .train() still called, so
+        # the following is a workaround:
+        if (
+            (args.fp16_full_eval or args.bf16_full_eval)
+            and not args.do_train
+            and not self.is_model_parallel
+            and self.model_init is None
+        ):
+            self._move_model_to_device(self.model, args.device)
+
+        if "model_path" in kwargs:
+            resume_from_checkpoint = kwargs.pop("model_path")
+            warnings.warn(
+                "`model_path` is deprecated and will be removed in a future version. Use `resume_from_checkpoint` "
+                "instead.",
+                FutureWarning,
+            )
+        if len(kwargs) > 0:
+            raise TypeError(f"train() got unexpected keyword arguments: {', '.join(list(kwargs.keys()))}.")
+        # This might change the seed so needs to run first.
+        self._hp_search_setup(trial)
+        self._train_batch_size = self.args.train_batch_size
+
+        # Model re-init
+        model_reloaded = False
+        if self.model_init is not None:
+            # Seed must be set before instantiating the model when using model_init.
+            enable_full_determinism(self.args.seed) if self.args.full_determinism else set_seed(self.args.seed)
+            self.model = self.call_model_init(trial)
+            model_reloaded = True
+            # Reinitializes optimizer and scheduler
+            self.optimizer, self.lr_scheduler = None, None
+
+        # Load potential model checkpoint
+        if isinstance(resume_from_checkpoint, bool) and resume_from_checkpoint:
+            resume_from_checkpoint = get_last_checkpoint(args.output_dir)
+            if resume_from_checkpoint is None:
+                raise ValueError(f"No valid checkpoint found in output directory ({args.output_dir})")
+
+        if resume_from_checkpoint is not None:
+            if not is_sagemaker_mp_enabled() and not self.is_deepspeed_enabled and not self.is_fsdp_enabled:
+                self._load_from_checkpoint(resume_from_checkpoint)
+            # In case of repeating the find_executable_batch_size, set `self._train_batch_size` properly
+            state = TrainerState.load_from_json(os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME))
+            if state.train_batch_size is not None:
+                self._train_batch_size = state.train_batch_size
+
+        # If model was re-initialized, put it on the right device and update self.model_wrapped
+        if model_reloaded:
+            if self.place_model_on_device:
+                self._move_model_to_device(self.model, args.device)
+            self.model_wrapped = self.model
+
+        self._load_or_generate_ref_completions()
+
+        inner_training_loop = find_executable_batch_size(
+            self._inner_training_loop, self._train_batch_size, args.auto_find_batch_size
+        )
+        if args.push_to_hub:
+            try:
+                # Disable progress bars when uploading models during checkpoints to avoid polluting stdout
+                hf_hub_utils.disable_progress_bars()
+                return inner_training_loop(
+                    args=args,
+                    resume_from_checkpoint=resume_from_checkpoint,
+                    trial=trial,
+                    ignore_keys_for_eval=ignore_keys_for_eval,
+                )
+            finally:
+                hf_hub_utils.enable_progress_bars()
+        else:
+            return inner_training_loop(
+                args=args,
+                resume_from_checkpoint=resume_from_checkpoint,
+                trial=trial,
+                ignore_keys_for_eval=ignore_keys_for_eval,
+            )
+
+    @staticmethod
+    def _prompt_key(prompt) -> str:
+        """Stable string key for any prompt format (str or list-of-dicts)."""
+        if isinstance(prompt, str):
+            return prompt
+        return json.dumps(prompt, sort_keys=True)
+
+    def _build_ref_cache_path(self, prompt_keys: list[str]) -> Path:
+        """Content-addressed path for the reference completions cache file.
+
+        The hash covers the model, the full eval prompt set, and the generation
+        parameters, so the cache is invalidated automatically if any of these change.
+        """
+        model_id = getattr(self.model.config, "name_or_path", "unknown")
+        key_str = json.dumps(
+            {
+                "model": model_id,
+                "prompts": sorted(prompt_keys),
+                "max_tokens": self.generation_config.max_tokens,
+                "temperature": self.temperature,
+                "top_p": self.top_p,
+            },
+            sort_keys=True,
+        )
+        digest = hashlib.sha256(key_str.encode()).hexdigest()[:16]
+        # Parent of output_dir is stable even when the run name changes.
+        return Path(self.args.output_dir).parent / f"ref_completions_{digest}.json"
+
+    def _load_or_generate_ref_completions(self) -> None:
+        """Generate and cache one reference completion per eval prompt, or load from disk.
+
+        Must be called before any training steps so the vLLM server still holds
+        the initial (reference) model weights. Only runs in server vLLM mode.
+        """
+        if self.eval_dataset is None or self.vllm_mode != "server":
+            return
+
+        # Collect all eval prompts across every process. Each call to gather_object
+        # returns the full list on every process, so we accumulate identically everywhere.
+        prompt_map: dict[str, str] = {}  # prompt_key → formatted text sent to vLLM
+        for batch in self.get_eval_dataloader(self.eval_dataset):
+            raw = batch["prompt"]
+            if is_conversational({"prompt": raw[0]}):
+                formatted = [
+                    apply_chat_template({"prompt": p}, self.processing_class)["prompt"] for p in raw
+                ]
+            else:
+                formatted = list(raw)
+            for r, t in zip(gather_object(list(raw)), gather_object(formatted)):
+                prompt_map.setdefault(self._prompt_key(r), t)  # keep first occurrence
+
+        cache_path = self._build_ref_cache_path(list(prompt_map.keys()))
+        if cache_path.exists():
+            if self.accelerator.is_main_process:
+                logger.info(f"Loading reference completions from cache: {cache_path}")
+            with open(cache_path) as f:
+                ref_completions = json.load(f)
+            self.ref_completions: dict[str, str] = ref_completions
+            return
+
+        # Cache miss: sync the sharded model weights to the vLLM server.
+        # _move_model_to_vllm() is a collective all-ranks operation — every rank
+        # must call it simultaneously before rank 0 can talk to the server.
+        self._move_model_to_vllm()
+        if self.accelerator.is_main_process:
+            logger.info(f"Generating reference completions; will cache at {cache_path}")
+            prompts_list = list(prompt_map.values())
+            batch_size = 64 #self.args.per_device_eval_batch_size or 1
+            all_completion_ids = []
+            for start in tqdm(
+                range(0, len(prompts_list), batch_size),
+                desc="Generating reference completions",
+                unit="batch",
+            ):
+                batch_prompts = prompts_list[start : start + batch_size]
+                batch_output = self.vllm_client.generate(
+                    prompts=batch_prompts,
+                    n=1,
+                    repetition_penalty=self.repetition_penalty,
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                    top_k=-1 if self.top_k is None else self.top_k,
+                    min_p=0.0 if self.min_p is None else self.min_p,
+                    max_tokens=self.generation_config.max_tokens,
+                )["completion_ids"]
+                all_completion_ids.extend(batch_output)
+
+            completions_text = [
+                self.processing_class.decode(ids, skip_special_tokens=True) for ids in all_completion_ids
+            ]
+            ref_completions = dict(zip(prompt_map.keys(), completions_text))
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(cache_path, "w") as f:
+                json.dump(ref_completions, f, indent=2)
+        else:
+            ref_completions = None
+
+        self.ref_completions = broadcast_object_list([ref_completions], from_process=0)[0]
+
     def evaluate(
         self,
         eval_dataset=None,
@@ -1499,7 +1723,8 @@ class OnlineDPOTrainer(BaseTrainer):
                 mask = first_half >= second_half
 
             elif self.judge is not None:
-                if is_conversational({"prompt": prompts[0]}):
+                is_conv = is_conversational({"prompt": prompts[0]})
+                if is_conv:
                     environment = jinja2.Environment()
                     template = environment.from_string(SIMPLE_CHAT_TEMPLATE)
                     prompts_text = [template.render(messages=p) for p in prompts]
@@ -1507,15 +1732,28 @@ class OnlineDPOTrainer(BaseTrainer):
                         template.render(messages=[{"role": "assistant", "content": c}]) for c in completions
                     ]
                 else:
+                    template = None
                     prompts_text = list(prompts)
                     completions_text = completions
 
-                # Gather to main process, judge once per batch, then broadcast ranks
-                # back so all processes can compute their local mask independently.
+                # Pair current-model completion (gen_0) against the cached reference
+                # completion when available; fall back to self-vs-self (gen_0 vs gen_1).
                 gathered_prompts = gather_object(prompts_text)
-                gathered_pairs = gather_object(
-                    [[completions_text[i], completions_text[i + batch_size]] for i in range(batch_size)]
-                )
+                if hasattr(self, "ref_completions") and self.ref_completions:
+                    pairs = []
+                    for i in range(batch_size):
+                        ref_raw = self.ref_completions.get(self._prompt_key(prompts[i]), "")
+                        ref_comp = (
+                            template.render(messages=[{"role": "assistant", "content": ref_raw}])
+                            if is_conv else ref_raw
+                        )
+                        pairs.append([completions_text[i], ref_comp])
+                else:
+                    pairs = [
+                        [completions_text[i], completions_text[i + batch_size]]
+                        for i in range(batch_size)
+                    ]
+                gathered_pairs = gather_object(pairs)
 
                 if self.accelerator.is_main_process:
                     ranks = self.judge.judge(gathered_prompts, gathered_pairs)
@@ -1564,26 +1802,26 @@ class OnlineDPOTrainer(BaseTrainer):
             total_loss += self.accelerator.gather_for_metrics(losses.mean()).mean().item()
             num_batches += 1
 
-        self.model.train()
 
         metrics: dict[str, float] = {}
         if num_batches > 0:
-            #metrics[f"{metric_key_prefix}_loss"] = total_loss / num_batches
-            metrics[f"{metric_key_prefix}/loss"] = total_loss / num_batches
+            metrics[f"{metric_key_prefix}_loss"] = total_loss / num_batches
         if self.accelerator.is_main_process:
             if total_valid > 0:
-                metrics[f"{metric_key_prefix}/win_rate"] = win_count / total_valid
-                metrics[f"{metric_key_prefix}/judge_success_rate"] = (
+                metrics[f"{metric_key_prefix}_win_rate"] = win_count / total_valid
+                metrics[f"{metric_key_prefix}_judge_success_rate"] = (
                     total_valid / total_samples if total_samples > 0 else 0.0
                 )
             if total_samples > 0:
-                metrics[f"{metric_key_prefix}/num_samples"] = float(total_samples)
+                metrics[f"{metric_key_prefix}_num_samples"] = float(total_samples)
 
         metrics = broadcast_object_list([metrics], from_process=0)[0]
         self.log(metrics)
         self.control = self.callback_handler.on_evaluate(
             self.args, self.state, self.control, metrics=metrics
         )
+
+        self.model.train()
         return metrics
 
     def _determine_best_metric(self, metrics, trial):
@@ -1631,7 +1869,7 @@ class OnlineDPOTrainer(BaseTrainer):
                     columns=["step", "prompt", "chosen", "rejected"],
                     data=[[s["step"], s["prompt"], s["chosen"], s["rejected"]] for s in self.train_samples],
                 )
-                wandb.log({"train/generations": table}, step=self.state.global_step)
+                wandb.log({"train/generations": table})
                 self.train_samples = []
 
             self._total_loss_scalar += tr_loss_scalar
